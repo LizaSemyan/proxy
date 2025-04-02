@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: proxy/dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/requests.db
+
+  api:
+    build:
+      context: .
+      dockerfile: api/dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/requests.db
+    depends_on:
+      - proxy
+
+volumes:
+  data:

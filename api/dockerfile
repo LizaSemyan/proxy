@@ -1,0 +1,13 @@
+FROM python:3.9-slim
+WORKDIR /app
+
+COPY api/requirements.txt .
+RUN pip install -r requirements.txt
+
+RUN mkdir -p /app/data && chmod 777 /app/data
+
+COPY api/main.py .
+
+COPY shared/ /app/shared/
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
