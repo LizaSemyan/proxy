@@ -1,6 +1,16 @@
 FROM python:3.9-slim
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y openssl ca-certificates
+
+COPY ./certs/ca.crt /app/certs/ca.crt
+COPY ./certs/ca.key /app/certs/ca.key
+
+RUN mkdir -p /usr/local/share/ca-certificates && \
+    cp /app/certs/ca.crt /usr/local/share/ca-certificates/mitm-proxy-ca.crt && \
+    chmod 644 /usr/local/share/ca-certificates/mitm-proxy-ca.crt && \
+    update-ca-certificates
+
 COPY proxy/requirements.txt .
 RUN pip install -r requirements.txt
 
