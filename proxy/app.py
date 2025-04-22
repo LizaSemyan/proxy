@@ -1,21 +1,30 @@
 import socket
 import threading
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import ssl
 import tempfile
 import os
 import subprocess
+import sqlite3
+import json
+from datetime import datetime
+import gzip
+import zlib
+import select
+import errno
 
 class HTTPProxy:
-    def __init__(self, host='0.0.0.0', port=8080):
+    def __init__(self, host='0.0.0.0', port=8080, db_path='/app/data/requests.db'):
         self.host = host
         self.port = port
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.db_path = db_path
         self.certs_dir = 'certs'
         os.makedirs(self.certs_dir, exist_ok=True)
         if not os.path.exists(os.path.join(self.certs_dir, 'ca.key')) or not os.path.exists(os.path.join(self.certs_dir, 'ca.crt')):
             self.generate_ca()
+        self.init_db()
 
     def generate_ca(self):
         key_path = os.path.join(self.certs_dir, 'ca.key')
@@ -33,6 +42,43 @@ class HTTPProxy:
             '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
             '-addext', 'subjectKeyIdentifier=hash'
         ], check=True)
+
+    def init_db(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    method TEXT,
+                    path TEXT,
+                    get_params TEXT,
+                    headers TEXT,
+                    cookies TEXT,
+                    body TEXT,
+                    post_params TEXT,
+                    timestamp DATETIME
+                );
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS responses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER,
+                    status_code INTEGER,
+                    message TEXT,
+                    headers TEXT,
+                    body TEXT,
+                    timestamp DATETIME,
+                    FOREIGN KEY(request_id) REFERENCES requests(id)
+                );
+            ''')
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error initializing database: {e}")
 
     def start(self):
         self.server_socket.bind((self.host, self.port))
@@ -72,7 +118,17 @@ class HTTPProxy:
         host, port = host_port.split(':') if ':' in host_port else (host_port, '443')
         port = int(port)
 
-        # Отправляем подтверждение CONNECT
+        parsed_request = self.parse_request(request)
+        request_id = self.save_request(
+            parsed_request['method'], 
+            parsed_request['path'], 
+            parsed_request['get_params'],
+            parsed_request['headers'],
+            parsed_request['cookies'],
+            parsed_request['body'],
+            parsed_request['post_params']
+        )
+
         client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
         key, cert = self.generate_cert(host)
@@ -90,13 +146,11 @@ class HTTPProxy:
                 client_context.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
                 client_context.verify_mode = ssl.CERT_NONE
 
-                # Критически важные настройки для Firefox
                 client_context.set_ciphers('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384')
                 
                 client_context.minimum_version = ssl.TLSVersion.TLSv1_2
                 client_context.maximum_version = ssl.TLSVersion.TLSv1_3
                 
-                # Обертка клиентского сокета
                 ssl_client = client_context.wrap_socket(
                     client_socket,
                     server_side=True,
@@ -111,7 +165,6 @@ class HTTPProxy:
                     print(f"Handshake error: {e}")
                     return
 
-                # Подключение к целевому серверу
                 server_socket = socket.create_connection((host, port), timeout=10)
                 server_context = ssl.create_default_context()
                 ssl_server = server_context.wrap_socket(
@@ -122,6 +175,14 @@ class HTTPProxy:
             
                 print(f"Tunnel established {ssl_client.version()} -> {ssl_server.version()}")
                 self.bidirectional_forward(ssl_client, ssl_server)
+
+                self.save_response(
+                    request_id=request_id,
+                    status_code=200,
+                    message="Connection Established",
+                    headers={},
+                    body=""
+                )
                 
             except Exception as e:
                 print(f"HTTPS error: {repr(e)}")
@@ -141,8 +202,25 @@ class HTTPProxy:
         modified_request = self.modify_request(request, host, path)
         print(f"Modified request:\n{modified_request}")
 
+        parsed_request = self.parse_request(request)
+
         response = self.forward_request(host, port, modified_request)
+        request_id = self.save_request(
+            parsed_request['method'], 
+            parsed_request['path'], 
+            parsed_request['get_params'],
+            parsed_request['headers'],
+            parsed_request['cookies'],
+            parsed_request['body'],
+            parsed_request['post_params']
+        )
+
         client_socket.sendall(response)
+
+        parsed_response = self.parse_response(response.decode())
+        self.save_response(request_id, parsed_response['status_code'], parsed_response['message'],
+                            parsed_response['headers'], parsed_response['body'])
+
 
     def generate_cert(self, hostname):
         os.makedirs('temp_certs', exist_ok=True)
@@ -219,11 +297,12 @@ subjectAltName=DNS:{hostname}""")
             return response
         
     def bidirectional_forward(self, src, dst):
-        import select
-        import errno
-        
         timeout = 60
         sockets = [src, dst]
+        buffer = b''
+        response_buffer = b''
+        request_saved = False
+        response_saved = False
         
         try:
             while True:
@@ -240,8 +319,45 @@ subjectAltName=DNS:{hostname}""")
                             
                         if sock is src:
                             dst.sendall(data)
+                            if not request_saved:
+                                buffer += data
+                                if b'\r\n\r\n' in buffer:
+                                    try:
+                                        text = buffer.decode(errors="replace")
+                                        parsed = self.parse_request(text)
+                                        request_id = self.save_request(
+                                            parsed['method'], 
+                                            parsed['path'], 
+                                            parsed['get_params'],
+                                            parsed['headers'],
+                                            parsed['cookies'],
+                                            parsed['body'],
+                                            parsed['post_params']
+                                        )
+
+                                        request_saved = True
+                                    except Exception as e:
+                                        print(f"[!] Error parsing HTTPS request: {e}")
                         else:
                             src.sendall(data)
+                            if request_saved and not response_saved:
+                                response_buffer += data
+                                if b'\r\n\r\n' in response_buffer:
+                                    try:
+                                        text = response_buffer.decode(errors="replace")
+                                        parsed_response = self.parse_response(text)
+
+                                        self.save_response(
+                                            request_id=request_id,
+                                            status_code=parsed_response['status_code'],
+                                            message=parsed_response['message'],
+                                            headers=parsed_response['headers'],
+                                            body=parsed_response['body']
+                                        )
+
+                                        response_saved = True
+                                    except Exception as e:
+                                        print(f"[!] Error parsing HTTPS response: {e}")
                             
                     except ssl.SSLWantReadError:
                         continue
@@ -267,6 +383,124 @@ subjectAltName=DNS:{hostname}""")
                 pass
             src.close()
             dst.close()
+    
+    def save_request(self, method, path, get_params, headers, cookies, body, post_params):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                INSERT INTO requests (method, path, get_params, headers, cookies, body, post_params, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (method, path, json.dumps(get_params), json.dumps(headers), json.dumps(cookies), body, json.dumps(post_params), datetime.now()))
+            conn.commit()
+            request_id = cursor.lastrowid 
+
+            conn.close()
+
+            return request_id
+        
+        except Exception as e:
+            print(f"Error saving request: {e}")
+            return None
+
+    def save_response(self, request_id, status_code, message, headers, body):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                INSERT INTO responses (request_id, status_code, message, headers, body, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (request_id, status_code, message, json.dumps(headers), body, datetime.now()))
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            print(f"Error saving request: {e}")
+
+    def parse_request(self, request):
+        lines = request.split('\r\n')
+        first_line = lines[0]
+        method, url, protocol = first_line.split()
+        parsed_url = urlparse(url)
+        
+        get_params = parse_qs(parsed_url.query)
+        headers = {}
+        cookies = {}
+        body = ''
+        post_params = {}
+        
+        i = 1
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if line == '':
+                break 
+            if ':' in line:
+                header, value = line.split(':', 1)
+                headers[header.strip()] = value.strip()
+                if header.lower() == 'cookie':
+                    cookies = self.parse_cookies(value.strip())
+
+        body = '\r\n'.join(lines[i:]).strip()
+
+        if headers.get('Content-Type') == 'application/x-www-form-urlencoded':
+            post_params = parse_qs(body)
+        
+        return {
+            "method": method,
+            "path": parsed_url.path,
+            "get_params": get_params,
+            "headers": headers,
+            "cookies": cookies,
+            "body": body,
+            "post_params": post_params
+        }
+
+    def parse_response(self, response):
+        lines = response.split('\r\n')
+        first_line = lines[0]
+        protocol, status_code, message = first_line.split(' ', 2)
+        
+        headers = {}
+        body = ''
+        
+        for line in lines[1:]:
+            if not line:
+                continue
+            if ':' in line:
+                header, value = line.split(":", 1)
+                headers[header.strip()] = value.strip()
+
+        body_start = response.find("\r\n\r\n")
+        if body_start != -1:
+            body = response[body_start + 4:]
+        else:
+            body = ''
+
+        if 'Content-Encoding' in headers:
+            encoding = headers['Content-Encoding']
+            if encoding == 'gzip':
+                body = gzip.decompress(body).decode('utf-8')
+            elif encoding == 'deflate':
+                body = zlib.decompress(body).decode('utf-8')
+        
+        return {
+            "status_code": int(status_code),
+            "message": message,
+            "headers": headers,
+            "body": body
+        }
+
+    def parse_cookies(self, cookie_str):
+        cookies = {}
+        for cookie in cookie_str.split(';'):
+            if '=' in cookie:
+                key, value = cookie.split('=', 1)
+                cookies[key.strip()] = value.strip()
+        return cookies
+    
 
 if __name__ == '__main__':
     proxy = HTTPProxy()
